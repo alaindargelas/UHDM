@@ -228,3 +228,73 @@ TEST(ExprReduceTest, ConditionalKeepsSizedArmWidth) {
   EXPECT_EQ(cat->VpiSize(), 3);
   EXPECT_EQ(eval.get_value(invalidValue, cat), 4);
 }
+
+// `$left` / `$right` / `$high` / `$low` with a DIMENSION argument answer for
+// that dimension, like `$size` already did.  On `logic [31:0] arr [15:0]` the
+// generic path read `ranges->at(0)` whatever was asked and, for an unpacked
+// array net (whose element typespec carries no range it looks at), fell
+// through to the bit-count sum: `$left(arr, 2)` came back 512.
+TEST(ExprReduceTest, BoundQueriesWalkTheRequestedDimension) {
+  Serializer s;
+  auto make_const = [&](const std::string& v, int size, int ctype) {
+    constant* c = s.MakeConstant();
+    c->VpiValue(v);
+    c->VpiSize(size);
+    c->VpiConstType(ctype);
+    return c;
+  };
+  auto make_range = [&](int l, int r) {
+    range* rg = s.MakeRange();
+    rg->Left_expr(make_const("UINT:" + std::to_string(l), 32, vpiUIntConst));
+    rg->Right_expr(make_const("UINT:" + std::to_string(r), 32, vpiUIntConst));
+    return rg;
+  };
+  // module top; logic [31:0] arr [15:0];
+  module_inst* top = s.MakeModule_inst();
+  top->VpiName("top");
+  logic_typespec* elem_ts = s.MakeLogic_typespec();
+  VectorOfrange* packed = s.MakeRangeVec();
+  packed->push_back(make_range(31, 0));
+  elem_ts->Ranges(packed);
+  logic_net* elem = s.MakeLogic_net();
+  elem->VpiName("arr");
+  ref_typespec* elem_rt = s.MakeRef_typespec();
+  elem_rt->Actual_typespec(elem_ts);
+  elem->Typespec(elem_rt);
+  array_net* arr = s.MakeArray_net();
+  arr->VpiName("arr");
+  VectorOfrange* unpacked = s.MakeRangeVec();
+  unpacked->push_back(make_range(15, 0));
+  arr->Ranges(unpacked);
+  VectorOfnet* nets = s.MakeNetVec();
+  nets->push_back(elem);
+  arr->Nets(nets);
+  VectorOfarray_net* array_nets = s.MakeArray_netVec();
+  array_nets->push_back(arr);
+  top->Array_nets(array_nets);
+
+  auto query = [&](const std::string& fn, int dim) -> int64_t {
+    sys_func_call* call = s.MakeSys_func_call();
+    call->VpiName(fn);
+    VectorOfany* args = s.MakeAnyVec();
+    ref_obj* ref = s.MakeRef_obj();
+    ref->VpiName("arr");
+    ref->Actual_group(arr);
+    args->push_back(ref);
+    args->push_back(make_const("UINT:" + std::to_string(dim), 32, vpiUIntConst));
+    call->Tf_call_args(args);
+    ExprEval eval;
+    bool invalidValue = false;
+    expr* r = eval.reduceExpr(call, invalidValue, top, nullptr);
+    if (r == nullptr || invalidValue || r->UhdmType() != uhdmconstant) return -999;
+    return eval.get_value(invalidValue, r);
+  };
+  EXPECT_EQ(query("$size", 1), 16);
+  EXPECT_EQ(query("$size", 2), 32);
+  EXPECT_EQ(query("$left", 1), 15);
+  EXPECT_EQ(query("$right", 1), 0);
+  EXPECT_EQ(query("$left", 2), 31);
+  EXPECT_EQ(query("$right", 2), 0);
+  EXPECT_EQ(query("$high", 2), 31);
+  EXPECT_EQ(query("$low", 2), 0);
+}
