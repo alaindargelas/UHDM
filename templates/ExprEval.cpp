@@ -5758,7 +5758,17 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
     // `$size(z)` / `$size(z, N)` on an unpacked array net returned
     // wrong values.  Handle `$size` independently before the generic
     // path.
-    if (name == "$size") {
+    // `$left` / `$right` / `$high` / `$low` take the same `[, dim]`
+    // argument and the generic path below is wrong for them in the same
+    // ways: it reads `ranges->at(0)` whatever dimension was asked for,
+    // and when the object is an unpacked array (an `array_net` /
+    // `array_var`, whose element typespec carries no range it looks at)
+    // it falls through to the bit-count sum and answers `$left(arr, 2)`
+    // on a `logic [31:0] arr [15:0]` with 512.  Walk the dimensions for
+    // them too.
+    const bool is_bound_query = (name == "$left") || (name == "$right") ||
+                                (name == "$high") || (name == "$low");
+    if ((name == "$size") || is_bound_query) {
       // Collect all dimensions (outer → inner: unpacked first, packed
       // last) of the first call argument.  `strip_outer` counts
       // bit_select / var_select indices we still need to strip from
@@ -5899,14 +5909,29 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
         }
         if (dim_index >= 1 && dim_index <= (int64_t)alldims.size()) {
           const DimEntry &d = alldims[dim_index - 1];
-          uint64_t dsize = (d.left > d.right)
-                               ? (uint64_t)(d.left - d.right) + 1
-                               : (uint64_t)(d.right - d.left) + 1;
+          int64_t v = 0;
+          if (name == "$size") {
+            v = (d.left > d.right) ? (d.left - d.right) + 1
+                                   : (d.right - d.left) + 1;
+          } else if (name == "$left") {
+            v = d.left;
+          } else if (name == "$right") {
+            v = d.right;
+          } else if (name == "$high") {
+            v = (d.left > d.right) ? d.left : d.right;
+          } else {  // $low
+            v = (d.left > d.right) ? d.right : d.left;
+          }
           constant *c = s.MakeConstant();
-          c->VpiValue("UINT:" + std::to_string(dsize));
-          c->VpiDecompile(std::to_string(dsize));
+          if (v < 0) {
+            c->VpiValue("INT:" + std::to_string(v));
+            c->VpiConstType(vpiIntConst);
+          } else {
+            c->VpiValue("UINT:" + std::to_string(v));
+            c->VpiConstType(vpiUIntConst);
+          }
+          c->VpiDecompile(std::to_string(v));
           c->VpiSize(64);
-          c->VpiConstType(vpiUIntConst);
           return c;
         }
       }
@@ -6012,6 +6037,9 @@ expr *ExprEval::reduceExpr(const any *result, bool &invalidValue,
                 }
               }
             }
+            // No range to answer from: leave the call for the consumer
+            // rather than returning the object's BIT COUNT as a bound.
+            return (expr *)result;
           }
 
           if (tps) {
