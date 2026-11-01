@@ -298,3 +298,66 @@ TEST(ExprReduceTest, BoundQueriesWalkTheRequestedDimension) {
   EXPECT_EQ(query("$high", 2), 31);
   EXPECT_EQ(query("$low", 2), 0);
 }
+
+// An element select of a packed table whose folded value is spelled HEX:
+// (or UINT:) must still be an ELEMENT select: `T[10]` on a
+// `logic [15:0][3:0] T = 64'h21748F3EDA09B65C` is 4'hF, not bit 10 (1'b1).
+// reducePackedElemSelect used to accept BIN: values only.
+TEST(ExprReduceTest, PackedElemSelectOnHexTable) {
+  Serializer s;
+  auto make_const = [&](const std::string& v, int size, int ctype) {
+    constant* c = s.MakeConstant();
+    c->VpiValue(v);
+    c->VpiSize(size);
+    c->VpiConstType(ctype);
+    return c;
+  };
+  auto make_range = [&](int l, int r) {
+    range* rg = s.MakeRange();
+    rg->Left_expr(make_const("UINT:" + std::to_string(l), 32, vpiUIntConst));
+    rg->Right_expr(make_const("UINT:" + std::to_string(r), 32, vpiUIntConst));
+    return rg;
+  };
+  // module top; localparam logic [15:0][3:0] T = 64'h21748F3EDA09B65C;
+  module_inst* top = s.MakeModule_inst();
+  top->VpiName("top");
+  logic_typespec* tts = s.MakeLogic_typespec();
+  VectorOfrange* rgs = s.MakeRangeVec();
+  rgs->push_back(make_range(15, 0));
+  rgs->push_back(make_range(3, 0));
+  tts->Ranges(rgs);
+  parameter* T = s.MakeParameter();
+  T->VpiName("T");
+  ref_typespec* trt = s.MakeRef_typespec();
+  trt->Actual_typespec(tts);
+  T->Typespec(trt);
+  constant* value = make_const("HEX:21748F3EDA09B65C", 64, vpiHexConst);
+  param_assign* pa = s.MakeParam_assign();
+  pa->Lhs(T);
+  pa->Rhs(value);
+  VectorOfparam_assign* pas = s.MakeParam_assignVec();
+  pas->push_back(pa);
+  top->Param_assigns(pas);
+
+  auto elem = [&](int idx) -> int64_t {
+    bit_select* sel = s.MakeBit_select();
+    sel->VpiName("T");
+    sel->VpiIndex(make_const("UINT:" + std::to_string(idx), 32, vpiUIntConst));
+    ExprEval eval;
+    // Surelog hands the base parameter's DECLARED typespec to the evaluator
+    // through this functor (the folded value constant carries none).
+    eval.setGetTypespecFunctor(
+        [&](std::string_view name, const any*, const any*) -> any* {
+          return (name == "T") ? (any*)tts : nullptr;
+        });
+    bool invalidValue = false;
+    expr* r = eval.reduceExpr(sel, invalidValue, top, nullptr);
+    if (r == nullptr || invalidValue || r->UhdmType() != uhdmconstant) return -999;
+    if (r->VpiSize() != 4) return -(1000 + r->VpiSize());
+    return eval.get_value(invalidValue, r);
+  };
+  EXPECT_EQ(elem(10), 0xF);
+  EXPECT_EQ(elem(1), 0x5);
+  EXPECT_EQ(elem(15), 0x2);
+  EXPECT_EQ(elem(0), 0xC);
+}
