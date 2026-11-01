@@ -2633,6 +2633,16 @@ static constant *reducePackedElemSelect(constant *c, int64_t selectIndex,
   if (!cts) cts = cts_fallback;
   const typespec *ets = nullptr;
   VectorOfrange *rgs = nullptr;
+  // The constant's OWN typespec may be the literal's (`64'h...` carries a
+  // plain 64-bit logic type), which has no element structure; the DECLARED
+  // typespec passed as cts_fallback is the one with the dimensions.  Try the
+  // constant's first, then the declared one.
+  for (int attempt = 0; attempt < 2 && !ets; attempt++) {
+  if (attempt == 1) {
+    if (!cts_fallback || cts_fallback == cts) break;
+    cts = cts_fallback;
+    rgs = nullptr;
+  }
   if (cts) {
     if (const packed_array_typespec *pt =
             any_cast<const packed_array_typespec *>(cts)) {
@@ -2661,10 +2671,25 @@ static constant *reducePackedElemSelect(constant *c, int64_t selectIndex,
       }
     }
   }
+  }
   if (!ets || !rgs || rgs->empty()) return nullptr;
+  // The table's folded value is spelled however Surelog folded it -- a
+  // concat of hex literals becomes HEX:, a decimal UINT: -- so take the bit
+  // string through toBinary (sized to vpiSize) rather than accepting BIN:
+  // alone; a `localparam logic [15:0][3:0] T = 64'h...` element-select was
+  // falling through to a BIT select for want of this.
   std::string_view v = c->VpiValue();
-  if (v.rfind("BIN:", 0) != 0) return nullptr;
-  std::string bits(v.substr(4));
+  std::string bits;
+  if (v.rfind("BIN:", 0) == 0) {
+    bits = std::string(v.substr(4));
+  } else if (v.rfind("HEX:", 0) == 0 || v.rfind("UINT:", 0) == 0 ||
+             v.rfind("INT:", 0) == 0 || v.rfind("OCT:", 0) == 0 ||
+             v.rfind("DEC:", 0) == 0) {
+    bits = ev->toBinary(c);
+    if (bits.empty()) return nullptr;
+  } else {
+    return nullptr;
+  }
   bool iv2 = false;
   int64_t l = ev->get_value(
       iv2, ev->reduceExpr(rgs->at(0)->Left_expr(), iv2, inst, pexpr, muteError));
@@ -3504,8 +3529,16 @@ any *ExprEval::hierarchicalSelector(std::vector<std::string> &select_path,
       const typespec *walk_ts = nullptr;
       if ((c->Typespec() == nullptr ||
            c->Typespec()->Actual_typespec() == nullptr) &&
-          inst && level >= 1) {
+          level >= 1) {
         const typespec *tps = nullptr;
+        // At COMPILE time there is no instance to walk, but the host knows
+        // the component's parameter typespecs (getTypespecFunctor ->
+        // getParamTypespec): a module-local `localparam logic [15:0][3:0] T
+        // = 64'h...; T[10]` was folding to BIT 10 for want of it.
+        if (!inst && getTypespecFunctor) {
+          if (any *tsobj = getTypespecFunctor(select_path[0], inst, pexpr))
+            tps = any_cast<const typespec *>(tsobj);
+        }
         // The base may be a PACKAGE parameter — resolve through the same
         // functor chain decodeHierPath uses.
         if (any *bobj = getObject(select_path[0], inst, pexpr, muteError)) {
